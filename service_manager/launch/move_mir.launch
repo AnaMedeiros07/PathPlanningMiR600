@@ -1,0 +1,12 @@
+<launch>
+    <!-- Executar um nó diretamente do package1 -->
+    <node pkg="service_manager" type="service_manager_node" name="service_manager_node" output="screen"/>
+    <!-- Executar um segundo nó do package2 diretamente -->
+    <node pkg="task_manager" type="task_manager_node" name="task_manager_node" output="screen"/>
+    <!-- Executar um segundo nó do package2 diretamente -->
+    <node pkg="precision_tasks" type="precision_tasks_node" name="precision_tasks_node" output="screen"/>
+    <!-- Executar um segundo nó do package2 diretamente -->
+    <node pkg="navigation_sdnl" type="navigation_node" name="navigation_node" output="screen"/>
+    <!-- Executar um segundo nó do package2 diretamente -->
+    <node pkg="navigation_structure" type="navigation_structure_node" name="navigation_structure_node" output="screen"/>
+</launch>

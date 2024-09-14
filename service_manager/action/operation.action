@@ -1,0 +1,15 @@
+# Goal 
+string task_name
+float32[] target 
+int32 lift
+float32 orientation
+
+---
+# Result 
+bool success
+string result_message
+
+---
+# Feedback
+int32 state
+string state_message

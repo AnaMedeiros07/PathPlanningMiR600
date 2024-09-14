@@ -1,0 +1,631 @@
+#include "obstacle_detection.h"
+
+//obstacle_detection_class::obstacle_detection_class(){ //construtor
+obstacle_detection_class::obstacle_detection_class():tfListener_rear(tfBuffer_rear),tfListener(tfBuffer){
+
+    ros::NodeHandle nh;   //no construtor, ter o handler
+    
+    //subscrever aos topicos que recebe os dados do Lidar (o Coppelia esta a publicar!)
+        sick_front_sub = nh.subscribe("lidar_front_data",100,&obstacle_detection_class::coppelia_sick_front_Callback,this);
+        sick_rear_sub = nh.subscribe("lidar_rear_data",100,&obstacle_detection_class::coppelia_sick_rear_Callback,this);
+    
+    //inicializar variaveis auxiliares para tratamento dados dos Lidar recebidos do Coppelia:
+        //para sensor frente:
+            front_lidar_data.assign(684,0.0);
+            distance_front.assign(684,0.0);
+            angle_front.assign(684,0.0);
+            x_robot_frame_front.assign(684,0.0);
+            y_robot_frame_front.assign(684,0.0);
+            incre_sensor_front.assign(684,0.0);
+            front_seq_receive=0;
+            sick_front_data_in.header.frame_id="sick1_f_frame";
+        //para sensor tras:
+            rear_lidar_data.assign(684,0.0);
+            distance_rear.assign(684,0.0);
+            angle_rear.assign(684,0.0);
+            x_robot_frame_rear.assign(684,0.0);
+            y_robot_frame_rear.assign(684,0.0);
+            incre_sensor_rear.assign(684,0.0);
+            rear_seq_receive=0;
+            sick_rear_data_in.header.frame_id="sick1_r_frame";
+            //tfListener_rear(tfBuffer_rear){}; //Nao se faz isto em class's...
+
+        //distancias aos obstaculos (apenas setores de interesse aos SDNL):
+            dist_obs_setor.assign(n_setores,30.0); //todos os setores a "detetar" 30m (no inicio)
+
+    //inicializar variaveis auxiliares:
+        clear_to_start=false;   //so iniciar o processo caso a Callback seja executada 1x
+        //para converter em setores:
+            theta_obs.assign(n_setores,0.0);
+            x_setor_final.assign(n_setores,0.0);
+            y_setor_final.assign(n_setores,0.0);
+        //ter distancia do corpo do robo a descontar na distancia medida em cada setor dinamico
+            robot_dist.assign(n_setores,0.0);
+
+        //variavel publicacao:
+            pub=true;// publicar os obstaculos para o modulo de  (true==quero publicar)
+
+    //variaveis para fazer o "sensor de estacionamento": (15/03)
+            //distancias:
+                dist_front_obs.assign(longitudinal_points,30.00); //by default is 30 m
+                dist_rear_obs.assign(longitudinal_points,30.00);
+                dist_right_obs.assign(lateral_points,30.00);
+                dist_left_obs.assign(lateral_points,30.00);
+            //angulos:
+                angle_front_obs.assign(longitudinal_points,0.00); //by default is 0 rad
+                angle_rear_obs.assign(longitudinal_points,0.00);
+                angle_right_obs.assign(lateral_points,0.00);
+                angle_left_obs.assign(lateral_points,0.00);
+            //referencias para calculo:
+                ref_lateral_points.assign(lateral_points,0.00); 
+                ref_longitudinal_points.assign(longitudinal_points,0.00);
+                distance_between_points_longitudinal= larg/(longitudinal_points-1); //frente ou tras
+                distance_between_points_lateral= compr/(lateral_points-1);          //laterais (dir ou esq)
+                min_x_incre=distance_between_points_lateral/2.0;
+                min_y_incre=distance_between_points_longitudinal/2.0;
+
+                for(int aux=0;aux<longitudinal_points;aux++){ //para frente e tras do veiculo
+                    ref_longitudinal_points[aux]=(aux*distance_between_points_longitudinal)-(larg/2);
+                    //ROS_INFO("pontos frente/tras referencia: para %d e de %f",aux,ref_longitudinal_points[aux]);
+                }
+
+                for(int aux=0;aux<lateral_points;aux++){ //para laterais do veiculo (esq e dir)
+                    ref_lateral_points[aux]=(aux*distance_between_points_lateral)-(compr/2);
+                    //ROS_INFO("pontos laterais referencia: para %d e de %f",aux,ref_lateral_points[aux]);
+                }
+
+            //para enviar dados ao miar_functions: (16/03)
+                setor_obs_pub = nh.advertise<miar_msgs::distance_sector>("sector_dist_obs",1); //publicar obs para SDNL
+                parking_sensors_pub = nh.advertise<miar_msgs::protect_distance>("protec_dist_obs",1); //publicar para definir distancia seguranca a volta do veiculo
+                sequ=0;//sequencia começa em 0
+
+
+           //determinar dist. minima:
+            min_lat_left=0.0;
+            min_lat_right=0.0;
+            min_front=0.0;
+            min_rear=0.0;
+            safety_first=true;
+
+            //Publicar  
+            safe_to_run = nh.advertise<std_msgs::Bool>("keep_safe_distance",1); //publicar obs para Omni
+            clear_to_run_pub.data=true;  //variavel a publicar
+
+            //Em (25/05):
+            safe_to_nav_SDNL = nh.advertise<std_msgs::Bool>("keep_safe_distance_SDNL",1); //publicar obs para SDNL;       //topico a publicar (se false-> para; se true->pode andar)
+            clear_to_navSDNL_pub.data = true;  //variavel a publicar
+}
+
+obstacle_detection_class::~obstacle_detection_class(){
+    //destructor
+
+}
+/* sensor_msgs::LaserScan:
+std_msgs/Header header
+  uint32 seq
+  time stamp
+  string frame_id
+float32 angle_min
+float32 angle_max
+float32 angle_increment
+float32 time_increment
+float32 scan_time
+float32 range_min
+float32 range_max
+float32[] ranges
+float32[] intensities
+*/
+
+//Callback que recebe os dados em bruto do sensor frontal(do Coppelia)
+void obstacle_detection_class::coppelia_sick_front_Callback(const sensor_msgs::LaserScan::ConstPtr& msg_coppelia_sick_front){
+   
+    if(msg_coppelia_sick_front->header.seq >= front_seq_receive){//se a msg recebida nao e antiga ou repetida:
+        ROS_INFO("-----------------------------SENSOR FRENTE-----------------------------");
+        front_lidar_data=msg_coppelia_sick_front->ranges;
+        incre_sensor_front=msg_coppelia_sick_front->intensities; //o vector 'intensities' foi utilizado para enviar os incrementos (a tropa manda desenrascar xD)
+        min_angle_front=msg_coppelia_sick_front->angle_min;      //!!!Pode dar asneira: se o tempo de execucao disto for superior a taxa de rececao!!!
+        front_laser_max_dist=msg_coppelia_sick_front->range_max;
+
+        front_seq_receive=msg_coppelia_sick_front->header.seq; //atualizar sequencia msg recebida
+    }
+    clear_to_start=true;
+}
+
+//Callback que recebe os dados em bruto do sensor traseiro(do Coppelia)
+void obstacle_detection_class::coppelia_sick_rear_Callback(const sensor_msgs::LaserScan::ConstPtr& msg_coppelia_sick_rear){
+   
+   if(msg_coppelia_sick_rear->header.seq >= rear_seq_receive){
+        ROS_INFO("-----------------------------SENSOR TRASEIRO-----------------------------");
+        rear_lidar_data=msg_coppelia_sick_rear->ranges;
+        incre_sensor_rear=msg_coppelia_sick_rear->intensities; //o vector 'intensities' foi utilizado para enviar os incrementos (a tropa manda desenrascar xD)
+        min_angle_rear=msg_coppelia_sick_rear->angle_min;      //!!!Pode dar asneira: se o tempo de execucao disto for superior a taxa de rececao!!!
+        rear_laser_max_dist=msg_coppelia_sick_rear->range_max;
+        
+        rear_seq_receive=msg_coppelia_sick_rear->header.seq;
+   }
+}
+
+//funcao que converte dados entre o referencial do sensor(frente) e o da plataforma
+bool obstacle_detection_class::convertFrameFrontLaser(){
+    float angle=min_angle_front;
+    sick_front_data_in.header.stamp=ros::Time();
+
+    for(int pos=0;pos<684;pos++){
+        //converter em posicoes cartesianas:
+        sick_front_data_in.point.x=cos(angle)*front_lidar_data[pos];
+        sick_front_data_in.point.y=sin(angle)*front_lidar_data[pos];
+
+        try{
+            tfBuffer.transform(sick_front_data_in, sick_front_data_kuka, "referencial_handler",ros::Duration(1.0)); //fica preso ate 1s ate que chegue novo broadcast (maximo)
+            //armazenar as novas posicoes(apos a transformacao):
+            x_robot_frame_front[pos]=(sick_front_data_kuka.point.x);
+            y_robot_frame_front[pos]=(sick_front_data_kuka.point.y);
+
+            distance_front[pos]=(sqrt(pow(sick_front_data_kuka.point.x, 2) + pow(sick_front_data_kuka.point.y, 2))); //distancia
+
+            //angle_front[b]=atan2(y_robot_frame_front, x_robot_frame_front);//angulo
+            angle_front[pos]=(atan2(sick_front_data_kuka.point.y, sick_front_data_kuka.point.x));
+            //ROS_INFO("Laser %d tem angulo %f (em graus %f)",pos,angle_front[pos],(angle_front[pos]*180.00)/3.1415);//Para debug!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            //codigo utilizado como debug das distancias lidas do sick, em relacao ao sensor e ao frame do robo
+/*                if(distance_front[pos]<display_measure){ //so para apresentar os setores de que detetam alguma coisa util
+                ROS_INFO("-------------------Novo setor-------------------");
+             //   ROS_INFO("Sick setor %d, esta em x= %f e y= %f", b, sick_front_data_in.point.x,sick_front_data_in.point.y);
+             //   ROS_INFO("Frame Robo setor %d, esta em x= %f e y= %f", b, sick_front_data_kuka.point.x,sick_front_data_kuka.point.y);
+                ROS_INFO("FRENTE: Setor %d, tem distancia de %f e angulo de %f", pos,distance_front[pos],(angle_front[pos]*180.00)/3.1415);
+                }*/
+        }
+        catch(tf2::TransformException& ex){
+            ROS_ERROR("Received an exception trying to transform a point from \"base_laser\" to \"base_link\": %s", ex.what());
+        }
+        angle=angle+incre_sensor_front[pos];
+    }
+    return true;
+}
+
+//funcao que converte dados entre o referencial do sensor(traseiro) e o da plataforma
+bool obstacle_detection_class::convertFrameRearLaser(){
+    float angle=min_angle_rear;
+    sick_rear_data_in.header.stamp=ros::Time();
+
+    for(int pos=0;pos<684;pos++){
+        //converter em posicoes cartesianas:
+        sick_rear_data_in.point.x=cos(angle)*rear_lidar_data[pos];
+        sick_rear_data_in.point.y=sin(angle)*rear_lidar_data[pos];
+
+        try{
+            tfBuffer.transform(sick_rear_data_in, sick_rear_data_kuka, "referencial_handler",ros::Duration(1.0)); //fica preso ate 1s ate que chegue novo broadcast (maximo)
+            //armazenar as novas posicoes(apos a transformacao):
+            x_robot_frame_rear[pos]=(sick_rear_data_kuka.point.x);
+            y_robot_frame_rear[pos]=(sick_rear_data_kuka.point.y);
+
+            distance_rear[pos]=(sqrt(pow(sick_rear_data_kuka.point.x, 2) + pow(sick_rear_data_kuka.point.y, 2))); //distancia
+            
+            angle_rear[pos]=(atan2(sick_rear_data_kuka.point.y, sick_rear_data_kuka.point.x));
+            
+             //codigo utilizado como debug das distancias lidas do sick, em relacao ao sensor e ao frame do robo
+/*                if(distance_rear[pos]<display_measure){ //so para apresentar os setores de que detetam alguma coisa util
+                    ROS_INFO("-------------------Novo setor-------------------");
+             //   ROS_INFO("Sick setor %d, esta em x= %f e y= %f", b, sick_front_data_in.point.x,sick_front_data_in.point.y);
+             //   ROS_INFO("Frame Robo setor %d, esta em x= %f e y= %f", b, sick_front_data_kuka.point.x,sick_front_data_kuka.point.y);
+                    ROS_INFO("Traseiro: Setor %d, tem distancia de %f e angulo de %f", pos,distance_rear[pos],(angle_rear[pos]*180.00)/3.1415);
+                }*/
+        }
+        catch(tf2::TransformException& ex){
+            ROS_ERROR("Received an exception trying to transform a point from \"base_laser\" to \"base_link\": %s", ex.what());
+        }
+        angle=angle+incre_sensor_rear[pos];
+    }
+    return true;
+}
+
+bool obstacle_detection_class::getObs_raw(){
+    ROS_INFO("Dados sensor frontal:");
+    convertFrameFrontLaser();
+  /*  for(int i=0;i<angle_front.size();i++) {
+        ROS_INFO("Imprimir debug(fr) x= %f e y= %f", x_robot_frame_front[i],y_robot_frame_front[i]);
+        ROS_INFO("Para i=%d, angulo e de %f rad (%f graus)",i,angle_front[i],(angle_front[i]*180.00)/M_PI);
+        ROS_INFO("Angulo  deveria de ser %f",(atan2(y_robot_frame_front[i],x_robot_frame_front[i])));
+    }*/
+    ROS_INFO("Dados sensor traseiro:");
+    convertFrameRearLaser();
+    /*for(int i=0;i<angle_rear.size();i++){
+        ROS_INFO("Imprimir debug(re) x= %f e y= %f", x_robot_frame_rear[i],y_robot_frame_rear[i]);
+        ROS_INFO("Para i=%d, angulo e de %f rad (%f graus)",i,angle_rear[i],(angle_rear[i]*180.00)/M_PI);
+        ROS_INFO("Angulo  deveria de ser %f",(atan2(y_robot_frame_rear[i],x_robot_frame_rear[i])));
+    } */      
+return true;
+}
+
+//esta funcao determina os angulos de cada setor dinamico (para os SDNL) em funcao do nº setores desejados e a gama de sensorizacao
+//A funcao tambem calcula a distancia a "descontar" em por cada setor (considerar o proprio corpo do robo)
+//NOTA: !!  O nº de setores TEM de ser um NUMERO IMPARE  !!
+bool obstacle_detection_class::setup_obs(){
+
+    float aux_inc=range/(n_setores-1.00);
+    float alfa=atan2(larg,compr);  //tem de ser atan2   !!!
+    //ROS_INFO("Angulo alfa e de %f", alfa); //para debug
+
+    for(int i=0;i<n_setores;i++){
+        theta_obs[i]=-(range/2.0)+aux_inc*i;            //definir os angulos que correspondem aos setores de interesse aos sistemas dinâmicos (n_setores/2 tem de corresponder a 0 graus (frente robo))
+        x_setor_final[i]=max_sensor*cos(theta_obs[i]);  //calcular ponto 'x' maximo do setor 'i'
+        y_setor_final[i]=max_sensor*sin(theta_obs[i]);  //calcular ponto 'y' maximo do setor 'i'
+        //ROS_INFO("Setor dinamica %d para angulo de %f (em graus: %f)",i, theta_obs[i], (theta_obs[i]*180.00)/M_PI);
+        
+        //caso os setores pertençam à parte frontal ou traseira do veiculo:
+        //este tem de ter modulo (pois passa por -pi!!):                        AQUI                AQUI
+        if((-alfa<=theta_obs[i] && theta_obs[i]<=alfa) || ((M_PI-alfa)<=fabs(theta_obs[i]) && fabs(theta_obs[i])>=(alfa-M_PI))){//    (-29,14<theta<29,14) ou (+150,86<theta<-150,86)
+            robot_dist[i]=fabs((compr/2.00)/cos(theta_obs[i]));
+            //ROS_INFO("Tras ou frente do robo. A distancia corpo robo e de %f metros",robot_dist[i]);
+//em caso de duvidas, ver caderno na data de 10/03/2022!!!!!
+        }
+        //caso os setores pertençam às laterais do veiculo:
+        else if((alfa<=theta_obs[i] && theta_obs[i]<=(M_PI-alfa)) || ((alfa-M_PI)<=theta_obs[i] && theta_obs[i]<=(-alfa))){
+            robot_dist[i]=fabs((larg/2.00)/sin(theta_obs[i]));
+            //ROS_INFO("Laterais do robo. A distancia corpo robo e de %f metros",robot_dist[i]);
+        }
+
+    }
+
+return true;
+}
+
+bool obstacle_detection_class::getdynamic_obs(){
+
+    float angle_min=0.0;
+    float angle_max=0.0;
+    float x_intersecao=0.0;
+    float y_intersecao=0.0;
+    float m_reta=0.0;   //declive da reta entre dois lasers consecutivos do sick
+    float b_reta=0.0;   //so a reta entre dois lasers consecutivos do sick tem 'b' (os setores saem do (0,0) do eixo central do veiculo)
+    float m_setor=0.0;  //declive setor dinamico
+    float distance=0.0;
+    dist_obs_setor.assign(n_setores,30.00);
+
+    getObs_raw();//para fazer as transformacoes entre referenciais.
+
+    //sensor frente (considerar todos os lasers-> nenhum deteta o proprio veiculo):
+    //comecar por '1' e nao por '0' pois na 1ª iteracao precisa do valor do angulo anterior!!!
+    for(int f=1;f<=angle_front.size();f++){  //'f' stands for 'front' (Stonks xD)
+//iniciado a 11/02
+        if(angle_front[f-1]<=angle_front[f]){ //tem que ter estas condicoes pois os angulos nao variam linearmente com os setores (pois os sick estao na lateral e a 45º do centro do veiculo)
+            angle_max=angle_front[f];
+            angle_min=angle_front[f-1];
+        }
+        else{   //caso contrario    (ex o setor 200 tem 30º e o setor 201 tem 29º devido à disposicao do obstaculo)
+            angle_max=angle_front[f-1];
+            angle_min=angle_front[f];
+        }
+
+//codigo teste desenvolvido a 14/03:
+/*
+        if(abs(abs(angle_front[f])-abs(angle_front[f-1]))>0.25){
+            ROS_INFO("!!!!!!!!!!!!!!Fazer ajuste ao angulo, descrepancia demasiada elevada!!!!!!!!!!!!!!!!!!!!!!");
+            if(angle_front[f]>0.00){
+                angle_max=angle_front[f]+0.0873;
+                angle_min=angle_front[f]-0.0873;
+            }
+            else {
+                angle_min=angle_front[f]+0.0873;
+                angle_max=angle_front[f]-0.0873;
+            }
+        }*/
+// FIm desse codigo teste
+
+//nao confundir o 'pos' e o 'f'!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        for(int pos=0;pos<n_setores;pos++){ //percorrer todos os setores dinâmicos definidos
+
+            if(angle_min<theta_obs[pos] && theta_obs[pos]<angle_max){ //se o angulo do setor esta dentro entre os dois "lasers" do sick:
+              
+                if((x_robot_frame_front[f]-x_robot_frame_front[f-1])==0.00){  //condicao 1 (ver caderno dia 08/03)
+                    x_intersecao=x_robot_frame_front[f];
+                    m_setor=y_setor_final[pos]/x_setor_final[pos]; //ou m_setor=sin(theta_obs[pos])/cos(theta_obs[pos]); ou ainda m_setor=tan(theta_obs[pos]);
+                    y_intersecao=x_intersecao*m_setor;
+                }
+                else if(x_setor_final[pos]==0.00){ //condicao 2 -> quando theta_obs[pos]==90º ou -90º (ver caderno dia 08/03)
+                    x_intersecao=0.0; //esta sobreposta ao eixo dos xx
+                    m_reta=(y_robot_frame_front[f]-y_robot_frame_front[f-1])/(x_robot_frame_front[f]-x_robot_frame_front[f-1]);
+                    b_reta=y_robot_frame_front[f]-m_reta*x_robot_frame_front[f];
+                    y_intersecao=b_reta;
+                }
+                else{ //condicao 3 -> o "normal" (ver caderno dia 08/03)
+                    m_setor=(y_setor_final[pos]/x_setor_final[pos]);
+                    m_reta=((y_robot_frame_front[f]-y_robot_frame_front[f-1])/(x_robot_frame_front[f]-x_robot_frame_front[f-1]));
+                    b_reta=y_robot_frame_front[f]-m_reta*x_robot_frame_front[f];
+                    x_intersecao=(b_reta/(m_setor-m_reta));
+                    y_intersecao=m_setor*x_intersecao;
+                }
+
+                distance=(sqrt(pow(x_intersecao, 2)+pow(y_intersecao, 2)))-robot_dist[pos]; //ja retirar a distancia do "corpo" do veiculo
+                //porquê utilizar o 'distance>0.0'? -> Não esquecer que estamos a subtrair o "corpo" do robo, mas em principio nao deveria de ser, se acontecer algo de errado aconteceu...
+                if(dist_obs_setor[pos]>distance && distance>0.00){//se a ultima distancia armazenada no setor 'pos' for maior do que a nova, ATUALIZAR COM A MENOR DISTANCIA!!!!!!!
+                    dist_obs_setor[pos]=distance;
+                    //ROS_INFO("O setor e o %d e o laser e %d", pos,f);
+                    //ROS_INFO("Frente: Entrei para Theta= %f. Angle_min=%f Angle_max=%f. Dist=%f",theta_obs[pos],angle_min,angle_max,distance);
+                    /*if(distance<0.50){//so para debug....
+                        ROS_INFO("O setor e o %d e o laser e %d", pos,f);
+                        ROS_INFO("Posicionamento de x= %f e y=%f.  A distancia a descontar do robo e de %f",x_intersecao,y_intersecao,robot_dist[pos]);
+                        }*/
+                }
+                //acho que nao e preciso meter o b_reta,m_reta,m_setor a 0, pois quando sao utilizados antes sao calculados
+            }
+        }
+    }
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //FAZER O FAMOSO 'copy+past' para fazer o mesmo para o sensor tras
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    for(int r=1;r<=angle_rear.size();r++){  //'r' stands for 'rear' (Stonks xD)
+//iniciado a 11/02
+        if(angle_rear[r-1]<angle_rear[r]){ //tem que ter estas condicoes pois os angulos nao variam linearmente com os setores (pois os sick estao na lateral e a 45º do centro do veiculo)
+            angle_max=angle_rear[r];
+            angle_min=angle_rear[r-1];
+        }
+        else{   //caso contrario    (ex o setor 200 tem 30º e o setor 201 tem 29º devido à disposicao do obstaculo)
+            angle_max=angle_rear[r-1];
+            angle_min=angle_rear[r];
+        }
+        //(ver caderno dia 15/03 para ver a razao deste if....)
+        if(angle_max-angle_min<M_PI){ //precisa deste 'if'caso dois lasers do lidar detetassem obstaculo em, p.e. -175º e outro em +175º a gama seria de 350º xD (esta solucao apenas e util caso nao utilizar sensores traseiros para a dinamica SDNL)
+
+//codigo teste desenvolvido a 14/03: (para detetar em menos setores, caso obstaculo demasiado proximo)
+//seria ajustado os setores ao proprio angulo dado pelo laser do sensor e nao na gama de detecao!
+/*
+        if(abs(abs(angle_rear[r])-abs(angle_rear[r-1]))>0.25){
+            ROS_INFO("!!!!!!!!!!!!!!Fazer ajuste ao angulo, descrepancia demasiada elevada!!!!!!!!!!!!!!!!!!!!!!");
+            if(angle_rear[r]>0.00){
+                angle_max=angle_rear[r]+0.0873;
+                angle_min=angle_rear[r]-0.0873;
+            }
+            else {
+                angle_min=angle_rear[r]+0.0873;
+                angle_max=angle_rear[r]-0.0873;
+            }
+        }*/
+// FIm desse codigo teste
+
+//nao confundir o 'pos' e o 'f'!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            for(int pos=0;pos<n_setores;pos++){ //percorrer todos os setores dinâmicos "impostos"
+
+                if(angle_min<theta_obs[pos] && theta_obs[pos]<angle_max){ //se o angulo do setor esta dentro entre os dois "lasers" do sick:
+
+                    if((x_robot_frame_rear[r]-x_robot_frame_rear[r-1])==0.00){  //condicao 1 (ver caderno dia 08/03)
+                        x_intersecao=x_robot_frame_rear[r];
+                        m_setor=y_setor_final[pos]/x_setor_final[pos]; //ou m_setor=sin(theta_obs[pos])/cos(theta_obs[pos]); ou ainda m_setor=tan(theta_obs[pos]);
+                        y_intersecao=x_intersecao*m_setor;
+                    }
+                    else if(x_setor_final[pos]==0.00){ //condicao 2 -> quando theta_obs[pos]==90º ou -90º (ver caderno dia 08/03)
+                        x_intersecao=0.0; //esta sobreposta ao eixo dos xx
+                        m_reta=(y_robot_frame_rear[r]-y_robot_frame_rear[r-1])/(x_robot_frame_rear[r]-x_robot_frame_rear[r-1]);
+                        b_reta=y_robot_frame_rear[r]-m_reta*x_robot_frame_rear[r];
+                        y_intersecao=b_reta;
+                    }
+                    else{ //condicao 3 -> o "normal" (ver caderno dia 08/03)
+                        m_setor=(y_setor_final[pos]/x_setor_final[pos]);
+                        m_reta=((y_robot_frame_rear[r]-y_robot_frame_rear[r-1])/(x_robot_frame_rear[r]-x_robot_frame_rear[r-1]));
+                        b_reta=y_robot_frame_rear[r]-m_reta*x_robot_frame_rear[r];
+                        x_intersecao=(b_reta/(m_setor-m_reta));
+                        y_intersecao=m_setor*x_intersecao;
+                    }
+
+                    distance=(sqrt(pow(x_intersecao, 2)+pow(y_intersecao, 2)))-robot_dist[pos]; //ja retirar a distancia do "corpo" do veiculo
+                    //porquê utilizar o 'distance>0.0'? -> Não esquecer que estamos a subtrair o "corpo" do robo, mas em principio nao deveria de ser, se acontecer algo de errado aconteceu...
+                    if(dist_obs_setor[pos]>distance && distance>0.00){//se a ultima distancia armazenada no setor 'pos' for maior do que a nova, ATUALIZAR COM A MENOR DISTANCIA!!!!!!!
+                        dist_obs_setor[pos]=distance;
+                        //ROS_INFO("Dinamica obs TRAS: setor %d, laser %d. Theta= %f, min_theta=%f max_theta=%f",pos,r,theta_obs[pos],angle_min,angle_max);
+                    }
+                }
+            }
+        }
+    }    
+    ROS_INFO("Finalizei a conversao....");
+    //verificacao:
+    for(int i=0;i<n_setores;i++){
+    ROS_INFO("Setor %d: dist= %f theta= %f (em graus %f)",i,dist_obs_setor[i],theta_obs[i],(theta_obs[i]*180.00)/M_PI);
+    }
+
+//*****************************************************************************
+//Parte distancias laterais e frontal e tras (tipo sensores estacionamento???)
+//                               15/03
+//*****************************************************************************
+
+//Porque 5m (e nao 30)? Pois a intencao e usar como aproximacao final, logo para curtas distancias (talvez em cm e poucos metros)
+    dist_front_obs.assign(longitudinal_points,5.00); //by default is 5 m
+    dist_rear_obs.assign(longitudinal_points,5.00);
+    dist_right_obs.assign(lateral_points,5.00);
+    dist_left_obs.assign(lateral_points,5.00);
+
+//parte frente e lateral direita (só sensor frontal):
+    for(int sensor_fr=0;sensor_fr<=angle_front.size()-1;sensor_fr++){
+        
+        //se for parte frontal do veiculo:             //talvez esta parte possa ser apagada.::::::::::::::::::::::::::::::::::::::::::::::::::::::
+        if(x_robot_frame_front[sensor_fr]>=(compr/2.0) && y_robot_frame_front[sensor_fr]>=(-(larg+min_y_incre)/2.0) && y_robot_frame_front[sensor_fr]<=((larg+min_y_incre)/2.0)){
+            //percorrer frente (uteis):
+            for(int f=0;f<longitudinal_points;f++){
+                //se pertence ao "setor" frontal nº 'f':
+                if(fabs(y_robot_frame_front[sensor_fr]-ref_longitudinal_points[f])<=min_y_incre){
+                    //distancias frontais estao em 'x'; se a nova distancia e inferior a anterior guardada atualiza:
+                    if((x_robot_frame_front[sensor_fr]-compr/2.0)<dist_front_obs[f]){
+                        dist_front_obs[f]=x_robot_frame_front[sensor_fr]-compr/2.0;//tirar o "corpo do veiculo"
+                    }
+                }
+            }
+        }
+        //se for parte lateral direita do veiculo:
+        else if(y_robot_frame_front[sensor_fr]<=(-larg/2.0) && x_robot_frame_front[sensor_fr]>=(-(compr+min_x_incre)/2.0) && x_robot_frame_front[sensor_fr]<=((compr+min_x_incre)/2.0)){
+            //percorrer latera (uteis):
+            for(int l_r=0;l_r<lateral_points;l_r++){    //l_r: lateral_right
+                //se pertence ao "setor" lateral nº 'l_r':
+                if(fabs(x_robot_frame_front[sensor_fr]-ref_lateral_points[l_r])<=min_x_incre){
+                    //distancias laterais estao em 'y'; se a nova distancia e inferior a anterior guardada atualiza:
+                    if((fabs(y_robot_frame_front[sensor_fr])-larg/2.0)<dist_right_obs[l_r]){
+                        dist_right_obs[l_r]=fabs(y_robot_frame_front[sensor_fr])-larg/2.0;//tirar o "corpo do veiculo"
+                    }
+                }
+            }
+        }
+    }   
+
+
+//parte tras e lateral esquerda (só sensor tras):
+
+    for(int sensor_re=0;sensor_re<=angle_rear.size()-1;sensor_re++){
+        
+        //se for parte tras do veiculo:             //talvez esta parte possa ser apagada.::::::::::::::::::::::::::::::::::::::::::::::::::::::
+        //as medidas em 'x' neste caso vao ser sempre negativas
+        if(x_robot_frame_rear[sensor_re]<=(-compr/2.0) && y_robot_frame_rear[sensor_re]>=(-(larg+min_y_incre)/2.0) && y_robot_frame_rear[sensor_re]<=((larg+min_y_incre)/2.0)){
+            //percorrer frente (uteis):
+            for(int r=0;r<longitudinal_points;r++){
+                //se pertence ao "setor" tras nº 'r':
+                if(fabs(y_robot_frame_rear[sensor_re]-ref_longitudinal_points[r])<=min_y_incre){
+                    //distancias frontais estao em 'x'; se a nova distancia e inferior a anterior guardada atualiza:
+                    if((fabs(x_robot_frame_rear[sensor_re])-compr/2.0)<dist_rear_obs[r]){
+                        dist_rear_obs[r]=fabs(x_robot_frame_rear[sensor_re])-compr/2.0;//tirar o "corpo do veiculo"
+                    }
+                }
+            }
+        }
+        //se for parte lateral esquerda do veiculo:
+        else if(y_robot_frame_rear[sensor_re]>=(larg/2.0) && x_robot_frame_rear[sensor_re]>=(-(compr+min_x_incre)/2.0) && x_robot_frame_rear[sensor_re]<=((compr+min_x_incre)/2.0)){
+            //percorrer latera (uteis):
+            for(int l_l=0;l_l<lateral_points;l_l++){    //l_l: lateral_left
+                //se pertence ao "setor" lateral nº 'l_r':
+                if(fabs(x_robot_frame_rear[sensor_re]-ref_lateral_points[l_l])<=min_x_incre){
+                    //distancias laterais estao em 'y'; se a nova distancia e inferior a anterior guardada atualiza:
+                    if((y_robot_frame_rear[sensor_re]-larg/2.0)<dist_left_obs[l_l]){
+                        dist_left_obs[l_l]=y_robot_frame_rear[sensor_re]-larg/2.0;//tirar o "corpo do veiculo"
+                    }
+                }
+            }
+        }
+    }   
+
+//fim?????? debug:
+
+/*    ROS_INFO("Frente, dist:");
+    for(int i=0;i<longitudinal_points;i++){
+        ROS_INFO("Sensor %d apresenta dist de %f",i,dist_front_obs[i]);
+    }*/
+/*    ROS_INFO("Tras, dist:");
+    for(int i=0;i<longitudinal_points;i++){
+        ROS_INFO("Sensor %d apresenta dist de %f",i,dist_rear_obs[i]);
+    }*/
+/*    ROS_INFO("Lateral direito, dist:");
+    for(int i=0;i<lateral_points;i++){
+        ROS_INFO("Sensor %d apresenta dist de %f",i,dist_right_obs[i]);
+    }*/
+ /*   ROS_INFO("Lateral esquerdo, dist:");
+    for(int i=0;i<lateral_points;i++){
+        ROS_INFO("Sensor %d apresenta dist de %f",i,dist_left_obs[i]);
+    }*/
+
+
+return true;
+}
+
+//funcao para enviar os dados dos obstaculos para a dinamica de navegacao:
+bool obstacle_detection_class::pub_obs_data(){
+
+//**Informacao para os SDNL (navegacao autonoma)**//
+    sectorMsgPub.nSectors=n_setores;        //21 setores
+    sectorMsgPub.range_field=range;         //210
+    sectorMsgPub.theta_obs=theta_obs;       //array com as posicoes entre -105 a +105 graus
+    sectorMsgPub.distances=dist_obs_setor;  //array com as distancias por cada theta
+    sectorMsgPub.header.seq=sequ;           //começa em 0 e vai incrementando em funcao do numero de vezes que e publicado
+
+//**Informacao para definir a dist. seguranca (tipo sensores estacionamento)**// 
+    distance_protectionMsgPub.header.seq=sequ;                  //sequencia da msg
+    
+    distance_protectionMsgPub.front_dist_obs=dist_front_obs;    // distancias frontais ao veiculo
+    distance_protectionMsgPub.rear_dist_obs=dist_rear_obs;      // distancias traseiras ao veiculo
+    distance_protectionMsgPub.right_dist_obs=dist_right_obs;    // distancias direita ao veiculo
+    distance_protectionMsgPub.left_dist_obs=dist_left_obs;      // distancias esquerda ao veiculo
+
+    distance_protectionMsgPub.min_lateral_position=-compr/2.0;    //ponto referencia: os vetores anteriores (dist. laterais) comecam sempre pela parte tras do veiculo (-1130/2=0.565)
+    distance_protectionMsgPub.min_fr_position=-larg/2.0;          //ponto referencia: os vetores anteriores (dist. frente e tras) comecam sempre pela parte direita do veiculo (-630/2=0.565)
+
+    distance_protectionMsgPub.inc_between_points_lateral=distance_between_points_lateral;
+    distance_protectionMsgPub.inc_between_points_fr=distance_between_points_longitudinal; 
+
+//dicas: do lado do recetor sabe o tamanho do array, pois vai desde distance_protectionMsgPub.min_lateral_position a abs(distance_protectionMsgPub.min_lateral_position) xD
+
+/*    ROS_INFO("Estou a publicar mensagem dos obstaculos...");
+    ROS_INFO("Dist min lateral e de %f e da f/r e de %f", distance_protectionMsgPub.min_lateral_position,distance_protectionMsgPub.min_fr_position);
+    ROS_INFO("dis. entre pontos laterais e de %f e f/r e de %f",distance_between_points_lateral,distance_between_points_longitudinal);
+*/
+    setor_obs_pub.publish(sectorMsgPub);                        //publicar a mensagem relativa aos setores
+    parking_sensors_pub.publish(distance_protectionMsgPub);     //publicar a mensagem relativa as dist. seguranca
+    
+    sequ++; //por fim incrementar a seq. de envio
+
+return true;
+}
+
+
+//verificar distancias minimas em 360º do veiculo. Publica 'false' caso o veiculo tenha que parar por seguranca
+bool obstacle_detection_class::min_value_vector_simple(){
+    min_lat_left = *min_element(dist_left_obs.begin(), dist_left_obs.end());
+    min_lat_right = *min_element(dist_right_obs.begin(), dist_right_obs.end());
+    min_rear = *min_element(dist_rear_obs.begin(), dist_rear_obs.end());
+    min_front = *min_element(dist_front_obs.begin(), dist_front_obs.end());
+    
+    if(min_lat_left<0.30 || min_lat_right<0.30 || min_rear<0.30 || min_front<0.30){ //parte navegacao 
+        clear_to_navSDNL_pub.data = false;
+        safe_to_nav_SDNL.publish(clear_to_navSDNL_pub);
+        
+        if(min_lat_left<0.10 || min_lat_right<0.10 || min_rear<0.10 || min_front<0.10){ //parte da navegacao omnidirecional
+            clear_to_run_pub.data=false;
+            safe_to_run.publish(clear_to_run_pub);  //parar!!
+            ROS_INFO("Mandar parar a navegacao omnidirecional");
+            return false;
+        }
+    }
+    else{
+        clear_to_navSDNL_pub.data = true;
+        safe_to_nav_SDNL.publish(clear_to_navSDNL_pub);
+        clear_to_run_pub.data=true;
+        safe_to_run.publish(clear_to_run_pub); //pode andar!!
+        return true; 
+    }
+    return true;
+}
+
+int main(int argc, char **argv)
+{  
+    ros::init(argc, argv, "obstacle_detection");
+    ros::NodeHandle n_priv("~");
+
+    obstacle_detection_class *localObst;
+    localObst = new obstacle_detection_class(); //cria objeto
+
+    ros::Rate rate(20); //20Hz (50ms)      //80Hz (12,5ms)
+
+    while(!(localObst->clear_to_start)){ //fica a espera que o 'positioning' fique operacional
+        
+        ROS_INFO("Ainda a espera do Positioning");
+        ros::spinOnce();
+		rate.sleep();
+    }
+    //definir os angulos dos setores dinamicos:
+    localObst->setup_obs();
+
+    while(ros::ok())
+    { 
+        localObst->getdynamic_obs();
+
+        if(pub_obs==1){//se for para enviar os dados
+            localObst->pub_obs_data();  //publica os dados dos sensores (nos topicos 'sector_dist_obs' e 'protec_dist_obs')
+        }
+        localObst->safety_first=localObst->min_value_vector_simple();
+        ROS_INFO("Verificacao obstaculos");
+        if(localObst->safety_first){
+            ROS_INFO("Seguro Para andar");
+        }
+        else{
+            ROS_INFO("Obstaculos demasiado proximos");
+        }
+
+        ros::spinOnce();
+	    rate.sleep();
+    }
+
+}
